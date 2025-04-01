@@ -55,9 +55,16 @@ def supervisor_node(state: MessagesState) -> Command[Literal[*members, "__end__"
         {"role": "system", "content": system_prompt},
     ] + state["messages"]
     response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    if goto == "FINISH":
+    
+    # Validate LLM output before using it
+    next_worker = response.get("next", "")
+    if next_worker not in options:
+        # Log and default to a safe option (END) if the output is invalid
+        print(f"Warning: Invalid next worker '{next_worker}' from LLM. Defaulting to END.")
         goto = END
+    else:
+        goto = END if next_worker == "FINISH" else next_worker
+        
     return Command(goto=goto)
 
 
@@ -87,17 +94,54 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
 
 
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
+    # Create a subclass of SQLDatabase with enhanced security features
+    class SecureSQLDatabase(SQLDatabase):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # List of disallowed SQL operations
+            self.disallowed_operations = [
+                "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "GRANT", "TRUNCATE", 
+                "CREATE", "REPLACE", "EXEC", "EXECUTE"
+            ]
+        
+        def run(self, command: str, fetch: str = "all") -> str:
+            """Execute a SQL command with security validation."""
+            # Convert query to uppercase for easier matching
+            command_upper = command.upper()
+            
+            # Check for disallowed operations
+            for operation in self.disallowed_operations:
+                if operation in command_upper.split():
+                    return f"Security Error: Disallowed SQL operation detected: {operation}"
+            
+            # Check for SQL comments that might be used to bypass restrictions
+            if "--" in command or "/*" in command:
+                return "Security Error: SQL comments are not allowed in queries"
+            
+            # If all checks pass, execute the original command
+            try:
+                return super().run(command, fetch)
+            except Exception as e:
+                return f"Error executing query: {str(e)}"
+    
+    # Create an instance of our secure database
+    db = SecureSQLDatabase.from_uri("sqlite:///als_patients.db")
+    
+    # Create the toolkit and tools using our secure database
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
 
     prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt")
     assert len(prompt_template.messages) == 1
 
+    # Update the system message to emphasize safety
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    SECURITY NOTICE: You are only permitted to perform SELECT queries. Any attempt to modify the database will be blocked.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -111,6 +155,7 @@ def create_database_admin_agent():
     Do NOT skip this step.
     Then you should query the schema of the most relevant tables."""
 
+    # Create the agent with the enhanced system message
     sql_agent_executor = create_react_agent(llm, tools, state_modifier=system_message)
     return sql_agent_executor
 
@@ -159,4 +204,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
