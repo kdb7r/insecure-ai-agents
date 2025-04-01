@@ -36,8 +36,8 @@ def guard_score(prompt: str) -> dict:
                 results_data = results_response.json().get("results", [])
 
         return {"flagged": is_flagged, "results": results_data}
-    except Exception as e:
-        print(f"Error occurred: {e}")
+    except Exception:
+        print("Error occurred during API request to Lakera Guard")
         return {"flagged": False, "results": []}  # Return default structure in case of failure
 
 
@@ -91,8 +91,8 @@ def eval_guard(df: pd.DataFrame, max_size: Optional[int] = None):
                 "results": response.get("results", [])
             })
 
-    except Exception as e:
-        print(f"Error occurred: {e}")
+    except Exception:
+        print("Error occurred when processing first prompt")
 
     # Iterate over the dataset with a progress bar (starting from the second prompt)
     for _, row in tqdm(df.head(max_size).iloc[1:].iterrows(), total=max_size-1, desc="Evaluating prompts"):
