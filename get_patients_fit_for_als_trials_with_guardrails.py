@@ -3,6 +3,7 @@ import os
 import asyncio
 import argparse
 import sqlite3
+import re
 from typing import Literal
 from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
@@ -87,18 +88,73 @@ async def clinical_researcher_node(state: MessagesState) -> Command[Literal["sup
     )
 
 
+class SafeSQLDatabase:
+    """A wrapper around SQLDatabase that enforces read-only access."""
+    
+    def __init__(self, original_db):
+        self.db = original_db
+    
+    @classmethod
+    def from_uri(cls, database_uri, **kwargs):
+        """Create a SafeSQLDatabase from a database URI."""
+        original_db = SQLDatabase.from_uri(database_uri, **kwargs)
+        return cls(original_db)
+    
+    def validate_sql_query(self, query):
+        """Validate SQL query for security."""
+        query_lower = query.lower().strip()
+        
+        # Only allow SELECT statements
+        if not query_lower.startswith('select '):
+            return False, "Only SELECT statements are allowed"
+        
+        # Check for dangerous operations
+        dangerous_ops = [
+            'drop', 'delete', 'update', 'insert', 
+            'alter', 'create', 'grant', 'revoke', 
+            'exec', 'pragma', 'attach', 'detach'
+        ]
+        
+        for op in dangerous_ops:
+            if f" {op} " in f" {query_lower} " or query_lower.startswith(f"{op} "):
+                return False, f"Operation not allowed: {op}"
+        
+        return True, ""
+    
+    def run(self, query, *args, **kwargs):
+        """Run SQL query with security validation."""
+        is_valid, reason = self.validate_sql_query(query)
+        if not is_valid:
+            return f"ERROR: Query rejected - {reason}"
+        
+        # If valid, delegate to the original database
+        return self.db.run(query, *args, **kwargs)
+    
+    # Delegate all other attributes to the original database
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
 def create_database_admin_agent():
-    db = SQLDatabase.from_uri("sqlite:///als_patients.db")
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    # Create a database with enforced read-only access
+    safe_db = SafeSQLDatabase.from_uri("sqlite:///als_patients.db")
+    toolkit = SQLDatabaseToolkit(db=safe_db, llm=llm)
     tools = toolkit.get_tools()
 
-    prompt_template = hub.pull("langchain-ai/sql-agent-system-prompt:31156d5f")
-    assert len(prompt_template.messages) == 1
-
+    # Updated system message with stronger security guidelines
     system_message = """System: You are an agent designed to interact with a SQL database filled with ALS patient data. Your name is Steve.
     You will work together with Charity who has access to a list of ALS clinical trials to determine which patients in the list you would recommend for each clinical trial.
     A patient should go to a clinical trial if they are likely to live longer than the Length of Study for that trial.
     Please provide a list of recommended patients for each trial.
+    
+    SECURITY RULES (CRITICAL):
+    - You are ONLY allowed to execute SELECT statements.
+    - Any attempt to modify data (INSERT, UPDATE, DELETE) is strictly forbidden.
+    - Any attempt to modify schema (DROP, CREATE, ALTER) is strictly forbidden.
+    - Any attempt to modify permissions (GRANT, REVOKE) is strictly forbidden.
+    - Any attempt to execute system commands or stored procedures is strictly forbidden.
+    - Violating these rules will result in query rejection and immediate termination.
+    
     Given an input question, create a syntactically correct SQLite query to run, then look at the results of the query and return the answer.
     You can order the results by a relevant column to return the most interesting examples in the database.
     Never query for all the columns from a specific table, only ask for the relevant columns given the question.
@@ -154,25 +210,53 @@ async def run_agents(prompt):
 
 
 def validate_prompt(prompt):
+    """
+    Validates that a prompt doesn't contain patient names from the database.
+    Implements security measures to prevent prompt injection via obfuscated names.
+    
+    Args:
+        prompt: The user input prompt to validate
+        
+    Returns:
+        bool: True if prompt passes validation, False if it contains patient names
+    """
+    if prompt is None:
+        return True
+        
+    # Connect to database and get patient names
     con = sqlite3.connect("als_patients.db")
     cursor = con.cursor()
     result = cursor.execute("SELECT name FROM patients ORDER BY name DESC")
     names_list_of_tuples = result.fetchall()
     cursor.close()
-    list_of_names = []
-    for name in names_list_of_tuples:
-        full_name = name[0]
-        full_name = full_name.split(" ")
-        first = full_name[0]
-        last = full_name[1]
-        list_of_names.append(first)
-        list_of_names.append(last)
-    words_in_prompt = prompt.split(" ")
-    common_strings = set(list_of_names) & set(words_in_prompt)
-    if common_strings:
-        return False
-    else:
-        return True
+    
+    # Normalize prompt: lowercase and remove non-alphanumeric characters (keep spaces)
+    normalized_prompt = re.sub(r'[^a-z0-9\s]', '', prompt.lower())
+    # Also create a version with no spaces for substring matching
+    normalized_prompt_no_spaces = normalized_prompt.replace(' ', '')
+    
+    for name_tuple in names_list_of_tuples:
+        full_name = name_tuple[0]
+        
+        # Check each name part (first name, last name, etc.)
+        name_parts = full_name.split()
+        for part in name_parts:
+            # Normalize name part: lowercase, remove non-alphanumeric
+            normalized_part = re.sub(r'[^a-z0-9]', '', part.lower())
+            
+            # Skip if normalized part is too short (to avoid false positives)
+            if len(normalized_part) <= 2:
+                continue
+            
+            # Check 1: Exact word match with word boundaries
+            if re.search(r'\b' + re.escape(normalized_part) + r'\b', normalized_prompt):
+                return False
+            
+            # Check 2: Substring match in the no-spaces version (catches obfuscation)
+            if normalized_part in normalized_prompt_no_spaces:
+                return False
+    
+    return True
 
 
 def main():
@@ -191,4 +275,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
